@@ -1305,20 +1305,37 @@ class _BaseModelBuilder:
             # Try indexed form first (``x[i]``), then fall back to
             # scalar form (bare ``x``) for models without a
             # declared population.  Both forms are accepted.
-            primary = None
-            scalar_form = False
-            for v in state_var_names:
-                if re.search(rf'\b{re.escape(v)}\[\s*i\s*\]', lhs_at_dt0):
-                    primary = v
-                    scalar_form = False
-                    break
-            if primary is None:
-                # No ``[i]`` in LHS — look for bare field name.
-                for v in state_var_names:
-                    if re.search(rf'\b{re.escape(v)}\b', lhs_at_dt0):
-                        primary = v
-                        scalar_form = True
-                        break
+            #
+            # Several state variables may appear on the LHS (a residual
+            # written as ``u - m*r - m*n*p = 0``, or ``Dt*m + u = ...``).
+            # The saddle text should define the variable whose LHS
+            # coefficient is a nonzero CONSTANT (no state variables in
+            # it) — preferring one not defined by an earlier equation
+            # and a unit coefficient — not merely the first one found.
+            cands_idx = [v for v in state_var_names
+                         if re.search(rf'\b{re.escape(v)}\[\s*i\s*\]', lhs_at_dt0)]
+            cands_bare = [] if cands_idx else [
+                v for v in state_var_names
+                if re.search(rf'\b{re.escape(v)}\b', lhs_at_dt0)]
+            scalar_form = not cands_idx
+            cands = cands_idx or cands_bare
+            primary = cands[0] if cands else None
+            if len(cands) > 1:
+                ranked = []
+                for v in cands:
+                    sp = self._lhs_dt0_split(lhs_text, v, scalar_form,
+                                             state_var_names)
+                    if sp is None:
+                        continue
+                    c_text, _rest, c_zero, c_state = sp
+                    ranked.append((
+                        0 if c_zero or c_state else 1,      # usable coefficient
+                        0 if f'{v}star' in self._mf_eqs_text else 1,
+                        1 if c_text.strip() in ('1', '-1') else 0,
+                        -cands.index(v), v))
+                if ranked:
+                    ranked.sort(reverse=True)
+                    primary = ranked[0][-1]
             if primary is None:
                 raise ValueError(
                     f'ModelBuilder.build(): cannot auto-derive an MF '
@@ -1352,8 +1369,114 @@ class _BaseModelBuilder:
                     rewritten_rhs,
                 )
 
+            # The saddle condition is LHS|_{Dt=0} = RHS, i.e.
+            # c·primary + rest = RHS.  The derivation above assumed
+            # c = 1 and rest = 0 (``x = RHS``), which silently
+            # mis-derives ``(Dt+mu)*x`` (saddle x* = RHS/mu) and
+            # ``Dt*m`` (the LHS vanishes at Dt=0 — there is no
+            # ``m* = RHS`` at all, and the sanity check then reports a
+            # non-vanishing tadpole with no hint why).  Read c and rest
+            # off the LHS symbolically and correct both cases.
+            split = self._lhs_dt0_split(lhs_text, primary, scalar_form,
+                                        state_var_names)
+            if split is not None:
+                c_text, rest_text, c_is_zero, _c_state = split
+                if c_is_zero:
+                    raise ValueError(
+                        f'ModelBuilder.build(): the LHS of the equation '
+                        f'lhs={lhs_text!r} vanishes at Dt=0 (it is a pure '
+                        f'time derivative), so its saddle-point condition '
+                        f'is 0 = ({rhs_text}) - ({rest_text}) and it does '
+                        f'not define {primary}star.  Put the algebraic '
+                        f'part of the drift on the LHS (e.g. '
+                        f"lhs='Dt*m + u', rhs='(M-m)/tauM' rather than "
+                        f"lhs='Dt*m', rhs='(M-m)/tauM - u'), or declare "
+                        f'the saddle with set_mf_equation(...).'
+                    )
+                if c_text.strip() != '1' or rest_text.strip() != '0':
+                    rewritten_rhs = (f'(({rewritten_rhs}) - ({rest_text}))'
+                                     f'/({c_text})')
+            else:
+                # Could not parse the LHS symbolically (a Conv(...) kernel,
+                # a population sum, a function call, or an LHS nonlinear in
+                # the state variables).  The derivation below assumes
+                # LHS|_{Dt=0} == primary; say so if that is visibly not the
+                # case, so a later "saddle does not satisfy its own
+                # equations" failure has a cause attached.
+                bare = re.sub(r'\s+', '', lhs_at_dt0)
+                if bare not in (primary, f'{primary}[i]'):
+                    import warnings
+                    warnings.warn(
+                        f'ModelBuilder.build(): could not read the '
+                        f'coefficient of {primary!r} off lhs={lhs_text!r}; '
+                        f'deriving the saddle text as {primary}star = RHS, '
+                        f'which is only right if the LHS reduces to '
+                        f'{primary} at Dt=0.  If the mean-field sanity '
+                        f'check fails, declare this saddle with '
+                        f'set_mf_equation(...).', stacklevel=3)
+
             saddle_name = f'{primary}star'
             self._mf_eqs_text[saddle_name] = rewritten_rhs
+
+    @staticmethod
+    def _lhs_dt0_split(lhs_text, primary, scalar_form, state_var_names):
+        """Split ``LHS|_{Dt=0}`` as ``c * primary + rest``.
+
+        Returns ``(c_text, rest_text, c_is_zero, c_depends_on_state)`` with state variables
+        written in saddle form (``vstar[i]``) and indexed parameters
+        restored to bracket form, or ``None`` when the LHS cannot be
+        parsed symbolically (the caller then keeps the legacy
+        ``primary = RHS`` derivation).  Spatial operators (``Laplacian``)
+        vanish at a homogeneous saddle like ``Dt``."""
+        import re
+        try:
+            from sage.all import SR, sage_eval, var
+        except ImportError:                        # pragma: no cover
+            return None
+        txt = re.sub(r'\bDt\b', '0', lhs_text)
+        txt = re.sub(r'\bLaplacian\b', '0', txt)
+        if 'Conv(' in txt or '*' == txt.strip():
+            return None
+        # ``name[i]`` → ``name__i``, ``name[i,j]`` → ``name__i__j``
+        txt = re.sub(
+            r'\b(\w+)\s*\[\s*([A-Za-z]\w*)\s*(?:,\s*([A-Za-z]\w*)\s*)?\]',
+            lambda m: m.group(1) + '__' + m.group(2)
+            + ('__' + m.group(3) if m.group(3) else ''), txt)
+        reserved = {'sum', 'for', 'in', 'exp', 'log', 'sqrt', 'sin', 'cos',
+                    'tanh', 'heaviside'}
+        names = {n for n in re.findall(r'\b[A-Za-z_]\w*\b', txt)
+                 if n not in reserved and not n[0].isdigit()}
+        syms = {n: var(n) for n in names}
+        try:
+            expr = SR(sage_eval(txt, locals=syms))
+        except Exception:
+            return None
+        prim = primary if scalar_form else primary + '__i'
+        if prim not in syms:
+            return None
+        ps = syms[prim]
+        try:
+            if not expr.is_polynomial(ps) or expr.degree(ps) > 1:
+                return None
+            c = expr.coefficient(ps, 1)
+            rest = (expr - c * ps).simplify_full()
+        except Exception:
+            return None
+
+        def back(e):
+            s = str(e)
+            for v in state_var_names:
+                if scalar_form:
+                    s = re.sub(rf'\b{re.escape(v)}\b', f'{v}star[i]', s)
+                else:
+                    s = re.sub(rf'\b{re.escape(v)}__i\b', f'{v}star[i]', s)
+            s = re.sub(r'\b(\w+)__([A-Za-z]\w*)__([A-Za-z]\w*)\b', r'\1[\2,\3]', s)
+            s = re.sub(r'\b(\w+)__([A-Za-z]\w*)\b', r'\1[\2]', s)
+            return s
+        state_syms = {syms[k] for k in syms
+                      if any(k == v or k == v + '__i' for v in state_var_names)}
+        c_state = bool(set(c.variables()) & state_syms)
+        return back(c), back(rest), bool(c.is_zero()), c_state
 
     def _compile_text_declarations(self) -> None:
         """Walk the text-based declarations and compile each into the
