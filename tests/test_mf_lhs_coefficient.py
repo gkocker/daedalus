@@ -125,3 +125,21 @@ def test_residual_form_as_entered_in_the_ui():
     mf = res['mf_values']
     assert np.isclose(np.ravel(mf['mstar'])[0], 1.25) and np.isclose(np.ravel(mf['ustar'])[0], 0.5)
     assert np.isclose(float(np.real(res['C_tau'][0])), 0.47167918, atol=1e-6)
+
+
+def test_unparseable_lhs_warns_instead_of_silently_guessing():
+    """An LHS the symbolic split cannot read falls back to 'x* = RHS' — with a
+    warning naming the equation, not silently."""
+    import warnings
+    b = (TemporalModelBuilder('conv').population('E', size=1)
+         .physical_field('v', population='E')
+         .parameter('tau', default=[1.0], indexed_by=['E']).parameter('Em', default=[1.0], indexed_by=['E'])
+         .parameter('w', default=[[0.5]], indexed_by=['E', 'E'])
+         .define_kernel('g', time_expr='exp(-t)*heaviside(t)', latex_name='g', indexed_by=['E', 'E'])
+         .set_action_text('sum(vt[i]*((tau[i]*Dt + 1)*v[i] - Em[i] - sum(w[i,j]*Conv(g[i,j], v[j]) for j in E)) for i in E)')
+         .equation(lhs='(tau[i]*Dt + 1)*v[i] - sum(w[i,j]*v[j] for j in E)', rhs='Em[i]', population='E'))
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter('always')
+        d = _derived(b)
+    assert d['vstar'] == 'Em[i]'
+    assert any('could not read the coefficient' in str(w.message) for w in rec)

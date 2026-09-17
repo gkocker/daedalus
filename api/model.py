@@ -1396,6 +1396,24 @@ class _BaseModelBuilder:
                 if c_text.strip() != '1' or rest_text.strip() != '0':
                     rewritten_rhs = (f'(({rewritten_rhs}) - ({rest_text}))'
                                      f'/({c_text})')
+            else:
+                # Could not parse the LHS symbolically (a Conv(...) kernel,
+                # a population sum, a function call, or an LHS nonlinear in
+                # the state variables).  The derivation below assumes
+                # LHS|_{Dt=0} == primary; say so if that is visibly not the
+                # case, so a later "saddle does not satisfy its own
+                # equations" failure has a cause attached.
+                bare = re.sub(r'\s+', '', lhs_at_dt0)
+                if bare not in (primary, f'{primary}[i]'):
+                    import warnings
+                    warnings.warn(
+                        f'ModelBuilder.build(): could not read the '
+                        f'coefficient of {primary!r} off lhs={lhs_text!r}; '
+                        f'deriving the saddle text as {primary}star = RHS, '
+                        f'which is only right if the LHS reduces to '
+                        f'{primary} at Dt=0.  If the mean-field sanity '
+                        f'check fails, declare this saddle with '
+                        f'set_mf_equation(...).', stacklevel=3)
 
             saddle_name = f'{primary}star'
             self._mf_eqs_text[saddle_name] = rewritten_rhs
