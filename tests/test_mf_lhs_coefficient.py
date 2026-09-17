@@ -98,3 +98,30 @@ def test_scalar_form_without_population():
          .equation(lhs='(Dt+mu)*x', rhs='-eps*x^3'))
     d = _derived(b)
     assert d['xstar'] == '((-eps*xstar[i]^3) - (0))/(mu)'
+
+
+def test_residual_form_as_entered_in_the_ui():
+    """The UI's MF tab is 'LHS − RHS = 0'; entering the residuals verbatim with
+    rhs='0' must define every saddle correctly (this is how the three-field
+    model was entered)."""
+    b = (TemporalModelBuilder('pi-residual')
+         .physical_field('n').physical_field('u').physical_field('m')
+         .parameter('f', default=0.5).parameter('r', default=0.3).parameter('p', default=0.2)
+         .parameter('M', default=2.0).parameter('tauM', default=1.5)
+         .set_action_text('''nt*n - (exp(nt)-1)*f + ut*u - (exp(ut)-1)*m*r - log(1 + p*(exp(ut)-1))*m*n
+                             + mt*(Dt*m + u) - (exp(mt)-1)*(M-m)/tauM''')
+         .equation(lhs='n-f', rhs='0')
+         .equation(lhs='u-m*r-m*n*p', rhs='0')
+         .equation(lhs='Dt*m + u - (M-m)/tauM', rhs='0'))
+    d = _derived(b)
+    assert set(d) == {'nstar', 'ustar', 'mstar'}
+    assert d['nstar'] == '((0) - (-f))/(1)'
+    assert d['ustar'] == '((0) - (-mstar[i]*nstar[i]*p - mstar[i]*r))/(1)'
+    assert 'ustar' in d['mstar'] and 'M' in d['mstar']
+    import numpy as np
+    import daedalus as dd
+    res = dd.run(b.build(), dd.Config(k=2, max_ell=0, external_fields=[('dm', 1), ('dm', 1)],
+                                      tau_grid=(0.0, 2.0, 3), parallel=False), None)
+    mf = res['mf_values']
+    assert np.isclose(np.ravel(mf['mstar'])[0], 1.25) and np.isclose(np.ravel(mf['ustar'])[0], 0.5)
+    assert np.isclose(float(np.real(res['C_tau'][0])), 0.47167918, atol=1e-6)

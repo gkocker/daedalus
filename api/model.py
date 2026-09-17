@@ -1305,20 +1305,37 @@ class _BaseModelBuilder:
             # Try indexed form first (``x[i]``), then fall back to
             # scalar form (bare ``x``) for models without a
             # declared population.  Both forms are accepted.
-            primary = None
-            scalar_form = False
-            for v in state_var_names:
-                if re.search(rf'\b{re.escape(v)}\[\s*i\s*\]', lhs_at_dt0):
-                    primary = v
-                    scalar_form = False
-                    break
-            if primary is None:
-                # No ``[i]`` in LHS — look for bare field name.
-                for v in state_var_names:
-                    if re.search(rf'\b{re.escape(v)}\b', lhs_at_dt0):
-                        primary = v
-                        scalar_form = True
-                        break
+            #
+            # Several state variables may appear on the LHS (a residual
+            # written as ``u - m*r - m*n*p = 0``, or ``Dt*m + u = ...``).
+            # The saddle text should define the variable whose LHS
+            # coefficient is a nonzero CONSTANT (no state variables in
+            # it) — preferring one not defined by an earlier equation
+            # and a unit coefficient — not merely the first one found.
+            cands_idx = [v for v in state_var_names
+                         if re.search(rf'\b{re.escape(v)}\[\s*i\s*\]', lhs_at_dt0)]
+            cands_bare = [] if cands_idx else [
+                v for v in state_var_names
+                if re.search(rf'\b{re.escape(v)}\b', lhs_at_dt0)]
+            scalar_form = not cands_idx
+            cands = cands_idx or cands_bare
+            primary = cands[0] if cands else None
+            if len(cands) > 1:
+                ranked = []
+                for v in cands:
+                    sp = self._lhs_dt0_split(lhs_text, v, scalar_form,
+                                             state_var_names)
+                    if sp is None:
+                        continue
+                    c_text, _rest, c_zero, c_state = sp
+                    ranked.append((
+                        0 if c_zero or c_state else 1,      # usable coefficient
+                        0 if f'{v}star' in self._mf_eqs_text else 1,
+                        1 if c_text.strip() in ('1', '-1') else 0,
+                        -cands.index(v), v))
+                if ranked:
+                    ranked.sort(reverse=True)
+                    primary = ranked[0][-1]
             if primary is None:
                 raise ValueError(
                     f'ModelBuilder.build(): cannot auto-derive an MF '
@@ -1363,7 +1380,7 @@ class _BaseModelBuilder:
             split = self._lhs_dt0_split(lhs_text, primary, scalar_form,
                                         state_var_names)
             if split is not None:
-                c_text, rest_text, c_is_zero = split
+                c_text, rest_text, c_is_zero, _c_state = split
                 if c_is_zero:
                     raise ValueError(
                         f'ModelBuilder.build(): the LHS of the equation '
@@ -1387,7 +1404,7 @@ class _BaseModelBuilder:
     def _lhs_dt0_split(lhs_text, primary, scalar_form, state_var_names):
         """Split ``LHS|_{Dt=0}`` as ``c * primary + rest``.
 
-        Returns ``(c_text, rest_text, c_is_zero)`` with state variables
+        Returns ``(c_text, rest_text, c_is_zero, c_depends_on_state)`` with state variables
         written in saddle form (``vstar[i]``) and indexed parameters
         restored to bracket form, or ``None`` when the LHS cannot be
         parsed symbolically (the caller then keeps the legacy
@@ -1438,7 +1455,10 @@ class _BaseModelBuilder:
             s = re.sub(r'\b(\w+)__([A-Za-z]\w*)__([A-Za-z]\w*)\b', r'\1[\2,\3]', s)
             s = re.sub(r'\b(\w+)__([A-Za-z]\w*)\b', r'\1[\2]', s)
             return s
-        return back(c), back(rest), bool(c.is_zero())
+        state_syms = {syms[k] for k in syms
+                      if any(k == v or k == v + '__i' for v in state_var_names)}
+        c_state = bool(set(c.variables()) & state_syms)
+        return back(c), back(rest), bool(c.is_zero()), c_state
 
     def _compile_text_declarations(self) -> None:
         """Walk the text-based declarations and compile each into the
